@@ -27,8 +27,8 @@ let roomVoters = {};
 let roomGameStates = {};
 let roomPhaseTimers = {};
 
-const BUFFER_SECONDS = 1;
-const HOT_SEAT_SECONDS = 1;
+const BUFFER_SECONDS = 10;
+const HOT_SEAT_SECONDS = 45;
 const VOTING_SECONDS = 35;
 const REVEAL_SECONDS = 10;
 const LEADERBOARD_SECONDS = 5;
