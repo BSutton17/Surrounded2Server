@@ -69,6 +69,11 @@ const RULE_POOL = [
   { rule: "Include the name of a day of the week in your answer", difficulty: 1 },
   { rule: "Say the word \"literally\" at least once per answer", difficulty: 1 },
   { rule: "Mention a body part in your answer", difficulty: 1 },
+  { rule: "Mention a fruit in every answer.", difficulty: 1 },
+  { rule: "Mention a vegetable in every answer.", difficulty: 1 },
+  { rule: "Include the word \"maybe\" in every answer.", difficulty: 2 },
+  { rule: "Mention a holiday in your answer.", difficulty: 1 },
+  { rule: "Include a household item in your answer", difficulty: 3 },
 
   // Difficulty 2: conversational/language style constraints (moderate)
   { rule: "Give the opposite of your real answer", difficulty: 2 },
