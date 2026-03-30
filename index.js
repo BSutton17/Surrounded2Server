@@ -28,7 +28,7 @@ let roomGameStates = {};
 let roomPhaseTimers = {};
 
 const BUFFER_SECONDS = 10;
-const HOT_SEAT_SECONDS = 30;
+const HOT_SEAT_SECONDS = 45;
 const VOTING_SECONDS = 35;
 const REVEAL_SECONDS = 10;
 const LEADERBOARD_SECONDS = 5;
@@ -65,9 +65,9 @@ const RULE_POOL = [
   { rule: "Say the name of a pokemon in your answer", difficulty: 1 },
   { rule: "Mention the name of a fast food restaurant in your answer", difficulty: 1 },
   { rule: "Your answer must include a reference to the weather", difficulty: 1 },
-  { rule: "Say the word \"honestly\" at least once", difficulty: 1 },
+  { rule: "Say the word \"honestly\" at least once per answer", difficulty: 1 },
   { rule: "Include the name of a day of the week in your answer", difficulty: 1 },
-  { rule: "Say the word \"literally\" at least once", difficulty: 1 },
+  { rule: "Say the word \"literally\" at least once per answer", difficulty: 1 },
   { rule: "Mention a body part in your answer", difficulty: 1 },
 
   // Difficulty 2: conversational/language style constraints (moderate)
@@ -91,6 +91,7 @@ const RULE_POOL = [
   { rule: "Answer in one sentence", difficulty: 2 },
   { rule: "Answer as if you are giving advice", difficulty: 2 },
   { rule: "Use the past tense in your answer", difficulty: 2 },
+  { rule: "Mention a controversal topic in each of your answers", difficulty: 2 },
 
   // Difficulty 3: physical/subtle behavior constraints (hard)
   { rule: "At any point, touch your head or face while you answer", difficulty: 3 },
@@ -111,7 +112,8 @@ const RULE_POOL = [
   { rule: "Close your eyes while answering (no, blinking doesn't count)", difficulty: 3 },
   { rule: "Use exaggerated hand gestures while you answer", difficulty: 3 },
   { rule: "Lightly tap the table before each sentence", difficulty: 3 },
-  { rule: "Turn your head briefly to one side before finishing", difficulty: 3 }
+  { rule: "Turn your head briefly to one side before finishing", difficulty: 3 },
+  { rule: "Sigh during or at the end of your answer", difficulty: 3 }
 ];
 
 function shuffle(items) {
