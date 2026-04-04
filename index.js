@@ -27,11 +27,11 @@ let roomVoters = {};
 let roomGameStates = {};
 let roomPhaseTimers = {};
 
-const BUFFER_SECONDS = 10;
-const HOT_SEAT_SECONDS = 45;
-const VOTING_SECONDS = 35;
-const REVEAL_SECONDS = 10;
-const LEADERBOARD_SECONDS = 5;
+const BUFFER_SECONDS = 12;
+const HOT_SEAT_SECONDS = 60;
+const VOTING_SECONDS = 60;
+const REVEAL_SECONDS = 15;
+const LEADERBOARD_SECONDS = 10;
 const TOTAL_ROUNDS = 5;
 const DISCONNECT_GRACE_MS = 180000;
 
