@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "nodemon index.js",
+    "start": "node index.js",
     "dev": "nodemon index.js"
   },
   "author": "",
@@ -12,7 +12,9 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "nodemon": "^2.0.22",
     "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
   }
 }

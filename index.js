@@ -1,31 +1,28 @@
 const express = require("express");
-const app = express();
 const http = require("http");
 const cors = require("cors");
+const { Server } = require("socket.io");
 
+const app = express();
 app.use(cors());
 
-const server = http.createServer(app);
-const io = require('socket.io')(server, {
-  cors: {
-    origin: ['http://localhost:5173', 'https://surroundedtwo.netlify.app'],
-    methods: ['GET', 'POST']
-  }
+// Heroku eco dynos sleep after 30 minutes without an HTTP request, and an open
+// socket does not count. The client hits this every few minutes mid-game.
+app.get("/ping", (_req, res) => {
+  res.set("Cache-Control", "no-store").send("pong");
 });
 
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: ["http://localhost:5173", "https://surroundedtwo.netlify.app"],
+    methods: ["GET", "POST"],
+  },
+});
 
-let rooms = {};
-// Track imposters per room
-let roomImposters = {};
-let playerAnswers = {};
-let playerNames = {};
-let disconnectTimers = {};
-let socketRooms = {};
-// Voting state per room (must be global, not per connection)
-let roomVotes = {};
-let roomVoters = {};
-let roomGameStates = {};
-let roomPhaseTimers = {};
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, rooms: rooms.size });
+});
 
 const BUFFER_SECONDS = 12;
 const HOT_SEAT_SECONDS = 60;
@@ -33,19 +30,10 @@ const VOTING_SECONDS = 60;
 const REVEAL_SECONDS = 15;
 const LEADERBOARD_SECONDS = 10;
 const TOTAL_ROUNDS = 5;
-const DISCONNECT_GRACE_MS = 180000;
-
-function getDisconnectKey(room, playerName) {
-  return `${room}::${playerName}`;
-}
-
-function clearDisconnectTimer(room, playerName) {
-  const key = getDisconnectKey(room, playerName);
-  if (disconnectTimers[key]) {
-    clearTimeout(disconnectTimers[key]);
-    delete disconnectTimers[key];
-  }
-}
+// How long a dropped player keeps their seat, rule and score.
+const DISCONNECT_GRACE_MS = 3 * 60 * 1000;
+const MAX_NAME_LENGTH = 20;
+const MAX_ROOM_CODE_LENGTH = 12;
 
 const RULE_POOL = [
   // Difficulty 1: obvious keyword/format constraints (easy to spot)
@@ -175,48 +163,6 @@ function buildRoundData(playerOrder, difficulty) {
   return { potentialRules, playerRules };
 }
 
-function getRoomPlayerOrder(room) {
-  if (!rooms[room] || !Array.isArray(rooms[room].players)) {
-    return [];
-  }
-  return rooms[room].players.map((player) => player.name);
-}
-
-function getSnakeOrder(baseOrder, roundNumber) {
-  if (roundNumber % 2 === 1) {
-    return [...baseOrder];
-  }
-  return [...baseOrder].reverse();
-}
-
-function clearRoomPhaseTimer(room) {
-  if (roomPhaseTimers[room]) {
-    clearTimeout(roomPhaseTimers[room]);
-    delete roomPhaseTimers[room];
-  }
-}
-
-function buildPhasePayload(state) {
-  return {
-    phase: state.phase,
-    hotSeat: state.playerOrder[state.currentTurnIndex] || null,
-    potentialRules: state.potentialRules,
-    endsAt: state.endsAt,
-    revealAssignments: state.revealAssignments || [],
-    scores: state.scores || {},
-    roundNumber: state.roundNumber || 0,
-    totalRounds: TOTAL_ROUNDS
-  };
-}
-
-function emitGameData(room, state) {
-  io.to(room).emit("game_data", {
-    potentialRules: state.potentialRules,
-    playerRules: state.playerRules,
-    scores: state.scores || {}
-  });
-}
-
 function sanitizeVotes(state, voterName, rawAssignments) {
   if (!rawAssignments || typeof rawAssignments !== "object") {
     return {};
@@ -251,21 +197,133 @@ function sanitizeVotes(state, voterName, rawAssignments) {
   return assignments;
 }
 
+// ---------------------------------------------------------------------------
+// Rooms
+//
+// Everything about a room lives on one object - its players, host, game and
+// timers - so tearing a room down is one delete instead of chasing eight maps.
+// ---------------------------------------------------------------------------
+
+const rooms = new Map();
+
+function createRoom(code) {
+  const room = {
+    code,
+    players: [], // { name, socketId, connected, lastSeenAt }
+    ownerName: null, // who opened the room - host comes back to them on return
+    hostName: null,
+    game: null,
+    timers: { phase: null, grace: {} },
+  };
+  rooms.set(code, room);
+  return room;
+}
+
+function destroyRoom(room) {
+  clearTimeout(room.timers.phase);
+  Object.values(room.timers.grace).forEach(clearTimeout);
+  rooms.delete(room.code);
+  console.log(`Room ${room.code} closed`);
+}
+
+const findPlayer = (room, name) => room.players.find((player) => player.name === name);
+const connectedPlayers = (room) => room.players.filter((player) => player.connected);
+
+// Never send socket ids to the browser - nobody needs them.
+const publicPlayers = (room) =>
+  room.players.map(({ name, connected }) => ({ name, connected, isHost: name === room.hostName }));
+
+// The host is the owner while they are online, otherwise the first connected
+// player - so a locked phone never leaves the room without controls.
+function reassignHost(room) {
+  const owner = findPlayer(room, room.ownerName);
+  if (owner && owner.connected) {
+    room.hostName = owner.name;
+    return;
+  }
+  const host = findPlayer(room, room.hostName);
+  if (host && host.connected) return;
+  const next = connectedPlayers(room)[0];
+  room.hostName = next ? next.name : null;
+}
+
+function emitPlayers(room) {
+  io.to(room.code).emit("updatePlayerList", publicPlayers(room));
+  io.to(room.code).emit("host_update", room.hostName);
+}
+
+function clearGraceTimer(room, name) {
+  clearTimeout(room.timers.grace[name]);
+  delete room.timers.grace[name];
+}
+
+// ---------------------------------------------------------------------------
+// Game flow: buffer -> hotseat (per player) -> voting -> reveal -> leaderboard
+// -> next round ... -> podium. Every phase is driven by one timer per room.
+// ---------------------------------------------------------------------------
+
+function getSnakeOrder(baseOrder, roundNumber) {
+  if (roundNumber % 2 === 1) {
+    return [...baseOrder];
+  }
+  return [...baseOrder].reverse();
+}
+
+function setPhaseTimer(room, seconds, next) {
+  clearTimeout(room.timers.phase);
+  room.timers.phase = setTimeout(() => {
+    room.timers.phase = null;
+    // The game may have been reset or the room closed while we waited.
+    if (rooms.get(room.code) === room && room.game) next();
+  }, seconds * 1000);
+}
+
+function enterPhase(room, phase, seconds) {
+  room.game.phase = phase;
+  room.game.endsAt = seconds ? Date.now() + seconds * 1000 : 0;
+  io.to(room.code).emit("turn_phase", buildPhasePayload(room.game));
+}
+
+function buildPhasePayload(state) {
+  return {
+    phase: state.phase,
+    hotSeat: state.playerOrder[state.currentTurnIndex] || null,
+    potentialRules: state.potentialRules,
+    endsAt: state.endsAt,
+    revealAssignments: state.revealAssignments || [],
+    scores: state.scores || {},
+    roundNumber: state.roundNumber || 0,
+    totalRounds: TOTAL_ROUNDS,
+  };
+}
+
+// Each player only ever receives their OWN rule. Broadcasting every rule to
+// the whole room let anyone read the answers out of devtools.
+function sendGameData(room, player) {
+  const state = room.game;
+  if (!state || !player.socketId) return;
+  const rule = state.playerRules[player.name];
+  io.to(player.socketId).emit("game_data", {
+    potentialRules: state.potentialRules,
+    playerRules: rule ? { [player.name]: rule } : {},
+    scores: state.scores || {},
+  });
+}
+
+function emitGameData(room) {
+  room.players.forEach((player) => sendGameData(room, player));
+}
+
 function startNewRound(room) {
-  const state = roomGameStates[room];
-  if (!state) {
-    return;
-  }
-
-  const baseOrder = getRoomPlayerOrder(room);
+  const state = room.game;
+  const baseOrder = room.players.map((player) => player.name);
   if (!baseOrder.length) {
-    clearRoomPhaseTimer(room);
-    delete roomGameStates[room];
+    clearTimeout(room.timers.phase);
+    room.game = null;
     return;
   }
 
-  state.roundNumber = (state.roundNumber || 0) + 1;
-
+  state.roundNumber += 1;
   if (state.roundNumber > TOTAL_ROUNDS) {
     startPodiumPhase(room);
     return;
@@ -278,7 +336,6 @@ function startNewRound(room) {
     const roundData = buildRoundData(playerOrder, difficulty);
     state.playerOrder = playerOrder;
     state.currentTurnIndex = 0;
-    state.turnsTaken = 0;
     state.potentialRules = roundData.potentialRules;
     state.playerRules = roundData.playerRules;
     state.votesByVoter = {};
@@ -290,18 +347,41 @@ function startNewRound(room) {
       }
     });
 
-    emitGameData(room, state);
+    emitGameData(room);
     startBufferPhase(room);
   } catch (error) {
-    io.to(room).emit("game_error", error.message || "Could not start new round.");
+    io.to(room.code).emit("game_error", error.message || "Could not start new round.");
   }
 }
 
-function finalizeVoting(room) {
-  const state = roomGameStates[room];
-  if (!state) {
+function startBufferPhase(room) {
+  enterPhase(room, "buffer", BUFFER_SECONDS);
+  setPhaseTimer(room, BUFFER_SECONDS, () => startHotSeatPhase(room));
+}
+
+function startHotSeatPhase(room) {
+  enterPhase(room, "hotseat", HOT_SEAT_SECONDS);
+  setPhaseTimer(room, HOT_SEAT_SECONDS, () => advanceTurn(room));
+}
+
+function advanceTurn(room) {
+  const state = room.game;
+  state.currentTurnIndex += 1;
+  if (state.currentTurnIndex >= state.playerOrder.length) {
+    startVotingPhase(room);
     return;
   }
+  startBufferPhase(room);
+}
+
+function startVotingPhase(room) {
+  room.game.votesByVoter = {};
+  enterPhase(room, "voting", VOTING_SECONDS);
+  setPhaseTimer(room, VOTING_SECONDS, () => finalizeVoting(room));
+}
+
+function finalizeVoting(room) {
+  const state = room.game;
 
   for (const [voterName, assignments] of Object.entries(state.votesByVoter || {})) {
     let points = 0;
@@ -317,309 +397,271 @@ function finalizeVoting(room) {
 
   state.revealAssignments = state.playerOrder.map((playerName) => ({
     player: playerName,
-    rule: state.playerRules[playerName] || ""
+    rule: state.playerRules[playerName] || "",
   }));
 
-  startRevealPhase(room);
-}
-
-function startVotingPhase(room) {
-  const state = roomGameStates[room];
-  if (!state || !state.playerOrder.length) {
-    return;
-  }
-
-  state.phase = "voting";
-  state.votesByVoter = {};
-  state.endsAt = Date.now() + VOTING_SECONDS * 1000;
-  io.to(room).emit("turn_phase", buildPhasePayload(state));
-
-  clearRoomPhaseTimer(room);
-  roomPhaseTimers[room] = setTimeout(() => {
-    finalizeVoting(room);
-  }, VOTING_SECONDS * 1000);
-}
-
-function startRevealPhase(room) {
-  const state = roomGameStates[room];
-  if (!state) {
-    return;
-  }
-
-  state.phase = "reveal";
-  state.endsAt = Date.now() + REVEAL_SECONDS * 1000;
-  io.to(room).emit("turn_phase", buildPhasePayload(state));
-
-  clearRoomPhaseTimer(room);
-  roomPhaseTimers[room] = setTimeout(() => {
-    startLeaderboardPhase(room);
-  }, REVEAL_SECONDS * 1000);
+  enterPhase(room, "reveal", REVEAL_SECONDS);
+  setPhaseTimer(room, REVEAL_SECONDS, () => startLeaderboardPhase(room));
 }
 
 function startLeaderboardPhase(room) {
-  const state = roomGameStates[room];
-  if (!state) {
-    return;
-  }
-
-  state.phase = "leaderboard";
-  state.endsAt = Date.now() + LEADERBOARD_SECONDS * 1000;
-  io.to(room).emit("turn_phase", buildPhasePayload(state));
-
-  clearRoomPhaseTimer(room);
-  roomPhaseTimers[room] = setTimeout(() => {
-    if ((state.roundNumber || 0) >= TOTAL_ROUNDS) {
+  enterPhase(room, "leaderboard", LEADERBOARD_SECONDS);
+  setPhaseTimer(room, LEADERBOARD_SECONDS, () => {
+    if (room.game.roundNumber >= TOTAL_ROUNDS) {
       startPodiumPhase(room);
       return;
     }
     startNewRound(room);
-  }, LEADERBOARD_SECONDS * 1000);
+  });
 }
 
 function startPodiumPhase(room) {
-  const state = roomGameStates[room];
-  if (!state) {
-    return;
-  }
-
-  state.phase = "podium";
-  state.endsAt = 0;
-  io.to(room).emit("turn_phase", buildPhasePayload(state));
-  clearRoomPhaseTimer(room);
+  clearTimeout(room.timers.phase);
+  room.timers.phase = null;
+  enterPhase(room, "podium", 0);
 }
 
-function startHotSeatPhase(room) {
-  const state = roomGameStates[room];
-  if (!state || !state.playerOrder.length) {
+// A player is gone for good (left, or never came back): take them out of the
+// game without skipping or repeating anybody's turn.
+function removePlayer(room, playerName) {
+  if (!findPlayer(room, playerName)) return;
+
+  clearGraceTimer(room, playerName);
+  room.players = room.players.filter((player) => player.name !== playerName);
+
+  if (room.players.length === 0) {
+    destroyRoom(room);
     return;
   }
 
-  state.phase = "hotseat";
-  state.endsAt = Date.now() + HOT_SEAT_SECONDS * 1000;
-  io.to(room).emit("turn_phase", buildPhasePayload(state));
+  if (room.ownerName === playerName) {
+    room.ownerName = (connectedPlayers(room)[0] || room.players[0]).name;
+  }
+  reassignHost(room);
+  emitPlayers(room);
 
-  clearRoomPhaseTimer(room);
-  roomPhaseTimers[room] = setTimeout(() => {
-    const latest = roomGameStates[room];
-    if (!latest || !latest.playerOrder.length) {
-      return;
-    }
-    latest.turnsTaken += 1;
+  const state = room.game;
+  if (!state) return;
 
-    if (latest.turnsTaken >= latest.playerOrder.length) {
+  const index = state.playerOrder.indexOf(playerName);
+  delete state.playerRules[playerName];
+  delete state.scores[playerName];
+  delete state.votesByVoter[playerName];
+  if (index === -1) return;
+
+  state.playerOrder.splice(index, 1);
+  const turnPhase = state.phase === "buffer" || state.phase === "hotseat";
+
+  if (index < state.currentTurnIndex) {
+    // Their turn already happened; keep pointing at the same next player.
+    state.currentTurnIndex -= 1;
+    io.to(room.code).emit("turn_phase", buildPhasePayload(state));
+  } else if (index === state.currentTurnIndex && turnPhase) {
+    // It was their turn: hand it straight to whoever is next.
+    if (state.currentTurnIndex >= state.playerOrder.length) {
       startVotingPhase(room);
-      return;
-    }
-
-    latest.currentTurnIndex += 1;
-    startBufferPhase(room);
-  }, HOT_SEAT_SECONDS * 1000);
-}
-
-function startBufferPhase(room) {
-  const state = roomGameStates[room];
-  if (!state || !state.playerOrder.length) {
-    return;
-  }
-
-  state.phase = "buffer";
-  state.endsAt = Date.now() + BUFFER_SECONDS * 1000;
-  io.to(room).emit("turn_phase", buildPhasePayload(state));
-
-  clearRoomPhaseTimer(room);
-  roomPhaseTimers[room] = setTimeout(() => {
-    startHotSeatPhase(room);
-  }, BUFFER_SECONDS * 1000);
-}
-
-function removePlayerFromRoom(room, playerName) {
-  if (!rooms[room] || !Array.isArray(rooms[room].players)) {
-    return;
-  }
-
-  const stillPresent = rooms[room].players.some((player) => player.name === playerName);
-  if (!stillPresent) {
-    return;
-  }
-
-  rooms[room].players = rooms[room].players.filter((player) => player.name !== playerName);
-  io.to(room).emit("updatePlayerList", rooms[room].players);
-
-  const gameState = roomGameStates[room];
-  if (gameState) {
-    gameState.playerOrder = gameState.playerOrder.filter((name) => name !== playerName);
-    delete gameState.playerRules[playerName];
-    delete gameState.scores[playerName];
-    delete gameState.votesByVoter[playerName];
-
-    if (gameState.playerOrder.length === 0) {
-      clearRoomPhaseTimer(room);
-      delete roomGameStates[room];
     } else {
-      if (gameState.currentTurnIndex >= gameState.playerOrder.length) {
-        gameState.currentTurnIndex = gameState.playerOrder.length - 1;
-      }
-      if (gameState.turnsTaken >= gameState.playerOrder.length) {
-        gameState.turnsTaken = gameState.playerOrder.length - 1;
-      }
-      io.to(room).emit("turn_phase", buildPhasePayload(gameState));
+      startBufferPhase(room);
     }
+  } else {
+    io.to(room.code).emit("turn_phase", buildPhasePayload(state));
   }
 }
+
+// ---------------------------------------------------------------------------
+// Sockets
+// ---------------------------------------------------------------------------
+
+// Trimmed string (numbers allowed, since room codes arrive as either), or ""
+// when missing or too long.
+const cleanString = (value, maxLength) => {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+  const trimmed = String(value).trim();
+  return trimmed.length <= maxLength ? trimmed : "";
+};
+
+// One bad packet must never crash the process - every room lives in memory.
+const safely = (event, handler) => (...args) => {
+  try {
+    handler(...args);
+  } catch (error) {
+    console.error(`Error handling "${event}":`, error);
+  }
+};
 
 io.on("connection", (socket) => {
   console.log(`User Connected: ${socket.id}`);
+  const on = (event, handler) => socket.on(event, safely(event, handler));
 
-  socket.on("startGame", (room) => {
-    const roomData = rooms[room];
-    if (!roomData || !Array.isArray(roomData.players) || roomData.players.length === 0) {
+  // The room and seat this socket currently owns. A socket whose seat was
+  // taken over by a newer connection (a refresh) owns nothing.
+  const currentSeat = () => {
+    const room = rooms.get(socket.data.room);
+    const player = room && findPlayer(room, socket.data.name);
+    return player && player.socketId === socket.id ? { room, player } : {};
+  };
+
+  const isHost = () => {
+    const { room, player } = currentSeat();
+    return Boolean(room && player && room.hostName === player.name);
+  };
+
+  on("join_room", (roomArg, nameArg, ack) => {
+    const reply = typeof ack === "function" ? ack : () => {};
+    const code = cleanString(roomArg, MAX_ROOM_CODE_LENGTH);
+    const name = cleanString(nameArg, MAX_NAME_LENGTH);
+    if (!code || !name) {
+      reply({ ok: false, message: "Enter a name (up to 20 characters) and a room code." });
       return;
     }
 
-    roomGameStates[room] = {
-      playerOrder: getRoomPlayerOrder(room),
+    // Moving to a different room on the same socket frees the old seat.
+    const previous = currentSeat();
+    if (previous.room && previous.room.code !== code) {
+      socket.leave(previous.room.code);
+      removePlayer(previous.room, previous.player.name);
+    }
+
+    const room = rooms.get(code) || createRoom(code);
+    let player = findPlayer(room, name);
+
+    if (player) {
+      // Same name again: a refresh or a reconnect. Hand the seat to the new
+      // socket and drop the stale one if it is somehow still open.
+      if (player.socketId && player.socketId !== socket.id) {
+        const stale = io.sockets.sockets.get(player.socketId);
+        if (stale) {
+          stale.data.room = null;
+          stale.disconnect(true);
+        }
+      }
+      clearGraceTimer(room, name);
+      player.socketId = socket.id;
+      player.connected = true;
+      player.lastSeenAt = Date.now();
+    } else {
+      player = { name, socketId: socket.id, connected: true, lastSeenAt: Date.now() };
+      room.players.push(player);
+    }
+
+    if (!room.ownerName) room.ownerName = name;
+    socket.join(code);
+    socket.data.room = code;
+    socket.data.name = name;
+    reassignHost(room);
+
+    // Catch a (re)joining player up on the game in progress.
+    if (room.game) {
+      if (typeof room.game.scores[name] !== "number") {
+        room.game.scores[name] = 0;
+      }
+      socket.emit("turn_phase", buildPhasePayload(room.game));
+      sendGameData(room, player);
+    }
+
+    console.log(`Player ${name} joined room ${code}`);
+    emitPlayers(room);
+    reply({ ok: true, players: publicPlayers(room), hostName: room.hostName });
+  });
+
+  // The room argument is ignored on the events below: a socket can only act
+  // on the room it actually joined.
+
+  on("startGame", () => {
+    const { room } = currentSeat();
+    if (!room || !isHost() || room.players.length === 0) return;
+
+    clearTimeout(room.timers.phase);
+    room.game = {
+      playerOrder: [],
       currentTurnIndex: 0,
-      turnsTaken: 0,
       roundNumber: 0,
       phase: "buffer",
       potentialRules: [],
       playerRules: {},
       votesByVoter: {},
       revealAssignments: [],
-      scores: {},
-      endsAt: 0
+      scores: Object.fromEntries(room.players.map((player) => [player.name, 0])),
+      endsAt: 0,
     };
 
-    roomGameStates[room].playerOrder.forEach((playerName) => {
-      roomGameStates[room].scores[playerName] = 0;
-    });
-
-    io.to(room).emit("gameStarted");
+    io.to(room.code).emit("gameStarted");
     startNewRound(room);
-    
-    console.log(`Game started in room: ${room}`);
+    console.log(`Game started in room: ${room.code}`);
   });
 
-  socket.on("question_answered", (room) => {
-    const state = roomGameStates[room];
-    if (!state || state.phase !== "hotseat") {
-      return;
-    }
+  on("question_answered", () => {
+    const { room } = currentSeat();
+    const state = room && room.game;
+    if (!state || !isHost() || state.phase !== "hotseat") return;
 
     const hotSeatPlayer = state.playerOrder[state.currentTurnIndex];
-    if (!hotSeatPlayer) {
-      return;
-    }
+    if (!hotSeatPlayer) return;
 
     state.scores[hotSeatPlayer] = (state.scores[hotSeatPlayer] || 0) + 0.5;
-    io.to(room).emit("turn_phase", buildPhasePayload(state));
+    io.to(room.code).emit("turn_phase", buildPhasePayload(state));
   });
 
-  socket.on("submit_votes", (room, rawAssignments) => {
-    const state = roomGameStates[room];
-    const voterName = playerNames[socket.id];
-    if (!state || state.phase !== "voting" || !voterName) {
-      return;
-    }
+  on("submit_votes", (_room, rawAssignments) => {
+    const { room, player } = currentSeat();
+    const state = room && room.game;
+    if (!state || state.phase !== "voting") return;
 
-    state.votesByVoter[voterName] = sanitizeVotes(state, voterName, rawAssignments);
+    state.votesByVoter[player.name] = sanitizeVotes(state, player.name, rawAssignments);
   });
 
-  
-  socket.on("reset_game", (room) => {
-    playerAnswers = {};
-    clearRoomPhaseTimer(room);
-    delete roomGameStates[room];
-    io.to(room).emit("reset_game");
+  on("reset_game", () => {
+    const { room } = currentSeat();
+    if (!room || !isHost()) return;
+
+    clearTimeout(room.timers.phase);
+    room.timers.phase = null;
+    room.game = null;
+    io.to(room.code).emit("reset_game");
   });
 
-  socket.on("join_room", (room, name, ack) => {
-    socket.join(room);
-    socketRooms[socket.id] = room;
-  
-    if (!rooms[room]) {
-      rooms[room] = { players: [] };
-    }
+  on("leave_room", () => {
+    const { room, player } = currentSeat();
+    socket.data.room = null;
+    if (!room) return;
 
-    const existingPlayer = rooms[room].players.find((p) => p.name === name);
-    // Allow seamless refresh by re-binding an active player name to the new socket.
-    if (existingPlayer && existingPlayer.connected && existingPlayer.socketId && existingPlayer.socketId !== socket.id) {
-      const previousSocketId = existingPlayer.socketId;
-      existingPlayer.socketId = socket.id;
-      delete playerNames[previousSocketId];
-      delete socketRooms[previousSocketId];
-      const previousSocket = io.sockets.sockets.get(previousSocketId);
-      if (previousSocket) {
-        previousSocket.disconnect(true);
+    socket.leave(room.code);
+    console.log(`${player.name} left room ${room.code}`);
+    removePlayer(room, player.name);
+  });
+
+  on("disconnect", (reason) => {
+    const { room, player } = currentSeat();
+    console.log(`User Disconnected: ${socket.data.name || "-"} (${socket.id}, ${reason})`);
+    if (!room) return;
+
+    // Hold the seat: the game keeps running on its timers, and the player
+    // drops straight back in where the room is when they reconnect.
+    player.connected = false;
+    player.lastSeenAt = Date.now();
+    player.socketId = null;
+    reassignHost(room);
+    emitPlayers(room);
+
+    clearGraceTimer(room, player.name);
+    room.timers.grace[player.name] = setTimeout(() => {
+      const stillGone = findPlayer(room, player.name);
+      if (rooms.get(room.code) === room && stillGone && !stillGone.connected) {
+        console.log(`${player.name} did not return to ${room.code} - removing`);
+        removePlayer(room, player.name);
       }
-    }
-  
-    // Check if player already exists by name (reconnect case)
-    let playerObj = existingPlayer;
-    if (!playerObj) {
-      playerObj = { name, voteCount: 0, connected: true, lastSeenAt: Date.now(), socketId: socket.id };
-      rooms[room].players.push(playerObj);
-    } else {
-      playerObj.connected = true;
-      playerObj.lastSeenAt = Date.now();
-      playerObj.socketId = socket.id;
-      clearDisconnectTimer(room, name);
-    }
-    playerNames[socket.id] = name;
-
-    if (roomGameStates[room]) {
-      if (typeof roomGameStates[room].scores[name] !== "number") {
-        roomGameStates[room].scores[name] = 0;
-      }
-      io.to(socket.id).emit("turn_phase", buildPhasePayload(roomGameStates[room]));
-      emitGameData(room, roomGameStates[room]);
-    }
-    
-    console.log(`Player ${name} joined room ${room}`);
-  
-    io.to(room).emit("updatePlayerList", rooms[room].players);
-    if (typeof ack === "function") {
-      ack({ ok: true, players: rooms[room].players });
-    }
-  });
-  
-
-  socket.on("disconnect", () => {
-    const playerName = playerNames[socket.id];
-    const room = socketRooms[socket.id];
-    console.log(`User Disconnected: ${playerName} (${socket.id})`);
-  
-    if (!playerName || !room || !rooms[room]) {
-      delete playerNames[socket.id];
-      delete socketRooms[socket.id];
-      return;
-    }
-
-    const playerObj = rooms[room].players.find((player) => player.name === playerName);
-    if (playerObj && playerObj.socketId === socket.id) {
-      playerObj.connected = false;
-      playerObj.lastSeenAt = Date.now();
-      playerObj.socketId = null;
-    } else {
-      delete playerNames[socket.id];
-      delete socketRooms[socket.id];
-      return;
-    }
-
-    clearDisconnectTimer(room, playerName);
-    const key = getDisconnectKey(room, playerName);
-    disconnectTimers[key] = setTimeout(() => {
-      removePlayerFromRoom(room, playerName);
-      delete disconnectTimers[key];
     }, DISCONNECT_GRACE_MS);
-  
-    // Clean up playerNames and disconnectTimers
-    delete playerNames[socket.id];
-    delete socketRooms[socket.id];
   });
-  
 });
 
 server.listen(process.env.PORT || 3001, () => {
   console.log("SERVER RUNNING");
+});
+
+// Heroku sends SIGTERM when it restarts or sleeps the dyno. Close sockets
+// cleanly so every client starts reconnecting straight away.
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received - shutting down");
+  io.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
 });
